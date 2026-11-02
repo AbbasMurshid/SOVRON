@@ -1,0 +1,1 @@
+-- Intentionally empty: local database tests use isolated fixtures and no production data.

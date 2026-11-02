@@ -1,13 +1,14 @@
-export type TxType = "income" | "expense" | "transfer" | "refund";
-export type Account = { id: string; name: string; kind: string; institution: string; openingBalance: number; createdAt: string };
-export type Transaction = { id: string; type: TxType; amount: number; category: string; accountId: string; destinationId?: string; merchant: string; date: string; note: string; createdAt: string };
-export type Budget = { id: string; category: string; limit: number; month: string };
-export type Goal = { id: string; name: string; target: number; saved: number; due: string };
+export type TxType = "income" | "expense" | "transfer" | "refund" | "credit_card_purchase" | "credit_card_payment";
+export type Account = { id: string; name: string; kind: string; institution: string; openingBalance: number; createdAt: string; version?: number };
+export type Transaction = { id: string; type: TxType; status?: "posted" | "voided"; amount: number; category: string; accountId: string; destinationId?: string; merchant: string; date: string; note: string; createdAt: string; version?: number };
+export type Budget = { id: string; category: string; limit: number; month: string; version?: number };
+export type Goal = { id: string; name: string; target: number; saved: number; due: string; version?: number };
+export type GoalContribution = { id: string; operationId?: string; goalId: string; amount: number; date: string; accountId?: string; transactionId?: string };
 export type DebtDirection = "i_owe" | "owed_to_me";
-export type DebtPayment = { id: string; amount: number; date: string; note: string };
-export type Debt = { id: string; person: string; direction: DebtDirection; amount: number; remaining: number; due: string; reminder: string; note: string; createdAt: string; payments: DebtPayment[] };
-export type FinanceState = { accounts: Account[]; transactions: Transaction[]; budgets: Budget[]; goals: Goal[]; debts: Debt[] };
-export const EMPTY_STATE: FinanceState = { accounts: [], transactions: [], budgets: [], goals: [], debts: [] };
+export type DebtPayment = { id: string; operationId?: string; amount: number; date: string; note: string; version?: number };
+export type Debt = { id: string; person: string; direction: DebtDirection; amount: number; remaining: number; due: string; reminder: string; note: string; createdAt: string; payments: DebtPayment[]; version?: number };
+export type FinanceState = { accounts: Account[]; transactions: Transaction[]; budgets: Budget[]; goals: Goal[]; goalContributions: GoalContribution[]; debts: Debt[] };
+export const EMPTY_STATE: FinanceState = { accounts: [], transactions: [], budgets: [], goals: [], goalContributions: [], debts: [] };
 export const CATEGORIES = ["Food & dining", "Transport", "Shopping", "Bills & utilities", "Health", "Entertainment", "Education", "Travel", "Salary", "Freelance", "Other"];
 
 // Keep monetary arithmetic in integer paise; convert to rupees only at the UI boundary.
@@ -18,9 +19,10 @@ export function sumMoney(values: number[]) { return fromPaise(values.reduce((tot
 export function accountBalances(state: FinanceState): Record<string, number> {
   const balances: Record<string, number> = Object.fromEntries(state.accounts.map(a => [a.id, toPaise(a.openingBalance)]));
   for (const t of state.transactions) {
+    if ((t.status ?? "posted") !== "posted") continue;
     if (t.type === "income" || t.type === "refund") balances[t.accountId] = (balances[t.accountId] ?? 0) + toPaise(t.amount);
-    if (t.type === "expense") balances[t.accountId] = (balances[t.accountId] ?? 0) - toPaise(t.amount);
-    if (t.type === "transfer") {
+    if (t.type === "expense" || t.type === "credit_card_purchase") balances[t.accountId] = (balances[t.accountId] ?? 0) - toPaise(t.amount);
+    if (t.type === "transfer" || t.type === "credit_card_payment") {
       balances[t.accountId] = (balances[t.accountId] ?? 0) - toPaise(t.amount);
       if (t.destinationId) balances[t.destinationId] = (balances[t.destinationId] ?? 0) + toPaise(t.amount);
     }
@@ -30,9 +32,9 @@ export function accountBalances(state: FinanceState): Record<string, number> {
 }
 
 export function monthSummary(state: FinanceState, month: string) {
-  const rows = state.transactions.filter(t => t.date.startsWith(month));
+  const rows = state.transactions.filter(t => t.date.startsWith(month) && (t.status ?? "posted") === "posted");
   const income = sumMoney(rows.filter(t => t.type === "income").map(t => t.amount));
-  const expenses = sumMoney(rows.filter(t => t.type === "expense").map(t => t.amount));
+  const expenses = sumMoney(rows.filter(t => t.type === "expense" || t.type === "credit_card_purchase").map(t => t.amount));
   const refunds = sumMoney(rows.filter(t => t.type === "refund").map(t => t.amount));
   const netSpend = fromPaise(toPaise(expenses) - toPaise(refunds));
   const saved = fromPaise(toPaise(income) - toPaise(expenses) + toPaise(refunds));
@@ -40,15 +42,39 @@ export function monthSummary(state: FinanceState, month: string) {
 }
 
 export function validateTransfer(state: FinanceState, sourceId: string, destinationId: string, amount: number) {
+  return validateTransaction(state, { type: "transfer", sourceId, destinationId, amount });
+}
+
+export function validateTransaction(state: FinanceState, input: { type: TxType; sourceId: string; destinationId?: string; amount: number }) {
+  const { type, sourceId, destinationId, amount } = input;
   const source = state.accounts.find(account => account.id === sourceId);
-  const destination = state.accounts.find(account => account.id === destinationId);
-  if (!source) return { ok: false, available: 0, message: "Choose a source account." };
-  if (!destination || source.id === destination.id) return { ok: false, available: 0, message: "Choose a different destination account." };
+  const destination = destinationId ? state.accounts.find(account => account.id === destinationId) : undefined;
+  if (!source) return { ok: false, available: 0, message: "Choose an account." };
   const sourceKind = source.kind.toLowerCase();
-  if (sourceKind.includes("card") || sourceKind.includes("liability")) return { ok: false, available: 0, message: "Transfers must start from a cash or asset account." };
+  const sourceIsCard = sourceKind.includes("card");
+  const sourceIsLiability = sourceIsCard || sourceKind.includes("liability");
+  const isAsset = (account: Account) => !account.kind.toLowerCase().includes("card") && !account.kind.toLowerCase().includes("liability");
   const available = accountBalances(state)[sourceId] ?? 0;
   if (!Number.isFinite(amount) || amount <= 0) return { ok: false, available, message: "Enter an amount greater than zero." };
-  if (toPaise(amount) > toPaise(available)) return { ok: false, available, message: `Only ${inr(Math.max(0, available))} is available in this account.` };
+  const twoSided = type === "transfer" || type === "credit_card_payment";
+  if (twoSided && !destinationId) return { ok: false, available, message: "Choose a destination account." };
+  if (!twoSided && destinationId) return { ok: false, available, message: "This transaction type cannot have a destination account." };
+  if (type === "transfer" || type === "credit_card_payment") {
+    if (!destination || source.id === destination.id) return { ok: false, available, message: "Choose a different destination account." };
+    if (!isAsset(source)) return { ok: false, available, message: "Transfers must start from a cash or asset account." };
+    if (type === "transfer" && !isAsset(destination)) return { ok: false, available, message: "Choose another cash or asset account. Use Credit card payment for card bills." };
+    if (type === "credit_card_payment" && !destination.kind.toLowerCase().includes("card")) return { ok: false, available, message: "Choose a credit card as the payment destination." };
+    if (toPaise(amount) > toPaise(available)) return { ok: false, available, message: `Only ${inr(Math.max(0, available))} is available in this account.` };
+  } else if (type === "credit_card_purchase") {
+    if (!sourceIsCard) return { ok: false, available, message: "Choose a credit card account for a card purchase." };
+  } else if (type === "income" && sourceIsLiability) {
+    return { ok: false, available, message: "Income must be deposited into a cash or asset account." };
+  } else if (type === "refund" && sourceKind.includes("liability") && !sourceIsCard) {
+    return { ok: false, available, message: "Refunds must post to an asset or credit card account." };
+  } else if (type === "expense") {
+    if (sourceIsLiability) return { ok: false, available, message: "Choose an asset account or select Credit card purchase." };
+    if (toPaise(amount) > toPaise(available)) return { ok: false, available, message: `This expense would exceed the ${source.name} balance (${inr(Math.max(0, available))} available).` };
+  }
   return { ok: true, available, message: "" };
 }
 
@@ -58,7 +84,21 @@ export function runDiagnostics(state: FinanceState): Diagnostic[] {
   const duplicateAccountIds = accountIds.size !== state.accounts.length;
   const duplicateTransactionIds = new Set(state.transactions.map(t => t.id)).size !== state.transactions.length;
   const invalidAmounts = state.transactions.some(t => !Number.isFinite(t.amount) || toPaise(t.amount) <= 0);
-  const badReferences = state.transactions.some(t => !accountIds.has(t.accountId) || (t.type === "transfer" && (!t.destinationId || !accountIds.has(t.destinationId) || t.destinationId === t.accountId)));
+  const accountById = new Map(state.accounts.map(account => [account.id, account]));
+  const badReferences = state.transactions.some(t => {
+    const source = accountById.get(t.accountId); const destination = t.destinationId ? accountById.get(t.destinationId) : undefined;
+    const sourceKind = source?.kind.toLowerCase() ?? ""; const destinationKind = destination?.kind.toLowerCase() ?? "";
+    const sourceLiability = sourceKind.includes("card") || sourceKind.includes("liability");
+    const destinationAsset = destination && !destinationKind.includes("card") && !destinationKind.includes("liability");
+    const accountTypeMismatch = (t.type === "income" || t.type === "expense" || t.type === "transfer") && sourceLiability
+      || t.type === "credit_card_purchase" && !sourceKind.includes("card")
+      || t.type === "credit_card_payment" && (sourceLiability || !destinationKind.includes("card"))
+      || t.type === "transfer" && !destinationAsset
+      || t.type === "refund" && sourceKind.includes("liability") && !sourceKind.includes("card");
+    return !source || ((t.type === "transfer" || t.type === "credit_card_payment") && (!destination || t.destinationId === t.accountId))
+      || ((t.type === "income" || t.type === "expense" || t.type === "refund" || t.type === "credit_card_purchase") && Boolean(t.destinationId))
+      || accountTypeMismatch;
+  });
   const accountBalance = accountBalances(state);
   const overdraft = state.accounts.some(a => !a.kind.toLowerCase().includes("liability") && !a.kind.toLowerCase().includes("card") && toPaise(accountBalance[a.id] ?? 0) < 0);
   const invalidGoals = state.goals.some(g => !Number.isFinite(g.target) || g.target <= 0 || !Number.isFinite(g.saved) || g.saved < 0 || !g.name.trim());

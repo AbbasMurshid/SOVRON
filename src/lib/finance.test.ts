@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { accountBalances, FinanceState, monthSummary, runDiagnostics, sumMoney, validateTransfer } from "./finance";
+import { accountBalances, FinanceState, monthSummary, runDiagnostics, sumMoney, validateTransaction, validateTransfer } from "./finance";
 
 const base: FinanceState = {
   accounts: [
@@ -12,7 +12,7 @@ const base: FinanceState = {
     { id: "r", type: "refund", amount: 200, category: "Shopping", accountId: "bank", merchant: "Return", date: "2026-11-03", note: "", createdAt: "" },
     { id: "t", type: "transfer", amount: 1000, category: "Transfer", accountId: "bank", destinationId: "cash", merchant: "Transfer", date: "2026-11-04", note: "", createdAt: "" },
     { id: "old", type: "expense", amount: 500, category: "Travel", accountId: "cash", merchant: "Bus", date: "2026-10-31", note: "", createdAt: "" },
-  ], budgets: [], goals: [], debts: [],
+  ], budgets: [], goals: [], goalContributions: [], debts: [],
 };
 
 describe("financial calculations", () => {
@@ -29,5 +29,26 @@ describe("financial calculations", () => {
   it("reports a negative asset account during diagnostics", () => {
     const state = { ...base, transactions: [...base.transactions, { id: "overdraw", type: "expense" as const, amount: 5000, category: "Other", accountId: "cash", merchant: "", date: "2026-11-05", note: "", createdAt: "" }] };
     expect(runDiagnostics(state).find(check => check.name === "Transfer balances")?.passed).toBe(false);
+  });
+  it("preserves negative credit card balances for purchases and payments", () => {
+    const state: FinanceState = { ...base, accounts: [...base.accounts, { id: "card", name: "Card", kind: "Credit card", institution: "", openingBalance: -1200, createdAt: "" }], transactions: [
+      { id: "purchase", type: "credit_card_purchase", amount: 250, category: "Food & dining", accountId: "card", merchant: "Cafe", date: "2026-11-05", note: "", createdAt: "" },
+      { id: "payment", type: "credit_card_payment", amount: 400, category: "Transfer", accountId: "bank", destinationId: "card", merchant: "Card bill", date: "2026-11-06", note: "", createdAt: "" },
+      ...base.transactions,
+    ] };
+    expect(accountBalances(state)).toMatchObject({ card: -1050, bank: 56300 });
+    expect(monthSummary(state, "2026-11")).toMatchObject({ expenses: 2750, count: 6 });
+  });
+  it("does not include voided transactions in balances or monthly totals", () => {
+    const state: FinanceState = { ...base, transactions: [...base.transactions, { id: "void", type: "expense", status: "voided", amount: 9999, category: "Other", accountId: "bank", merchant: "Voided", date: "2026-11-07", note: "", createdAt: "" }] };
+    expect(accountBalances(state)).toEqual(accountBalances(base));
+    expect(monthSummary(state, "2026-11")).toEqual(monthSummary(base, "2026-11"));
+  });
+  it("blocks an asset expense that would overdraw its account", () => expect(validateTransaction(base, { type: "expense", sourceId: "cash", amount: 1001 })).toMatchObject({ ok: false }));
+  it("requires a card account for card purchases and a card destination for payments", () => {
+    const state: FinanceState = { ...base, accounts: [...base.accounts, { id: "card", name: "Card", kind: "Credit card", institution: "", openingBalance: -100, createdAt: "" }] };
+    expect(validateTransaction(state, { type: "credit_card_purchase", sourceId: "bank", amount: 10 }).ok).toBe(false);
+    expect(validateTransaction(state, { type: "credit_card_payment", sourceId: "bank", destinationId: "cash", amount: 10 }).ok).toBe(false);
+    expect(validateTransaction(state, { type: "credit_card_payment", sourceId: "bank", destinationId: "card", amount: 10 }).ok).toBe(true);
   });
 });
