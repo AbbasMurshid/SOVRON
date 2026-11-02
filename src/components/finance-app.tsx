@@ -4,7 +4,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Activity, ArrowDownLeft, ArrowLeftRight, ArrowUpRight, Bell, BriefcaseBusiness, CalendarDays, Check, ChevronDown, CircleHelp, CreditCard, Download, Ellipsis, FileChartColumn, Goal, Home, Landmark, ListFilter, Menu, Plus, Search, Settings, ShieldCheck, ShoppingBag, Sparkles, Target, Trash2, Wallet, X } from "lucide-react";
 import { Account, Budget, CATEGORIES, Debt, DebtPayment, Diagnostic, EMPTY_STATE, FinanceState, fromPaise, Goal as FinanceGoal, GoalContribution, inr, makeId, monthSummary, runDiagnostics, sumMoney, Transaction, TxType, validateTransaction, validateTransfer, accountBalances, toPaise } from "@/lib/finance";
 import { getBrowserSupabase } from "@/lib/supabase/browser";
-import { deleteCloudDebtPayment, editCloudDebtPayment, loadCloudState, recordCloudDebtPayment, resetCloudData, saveCloudState } from "@/lib/cloud-store";
+import { deleteCloudDebtPayment, editCloudDebtPayment, loadCloudState, recordCloudDebtPayment, recordCloudGoalContribution, resetCloudData, saveCloudState, type GoalContributionOperation } from "@/lib/cloud-store";
+import { browserOperationOutbox, type PendingOperation } from "@/lib/operation-outbox";
 import type { User } from "@supabase/supabase-js";
 
 type Section = "Dashboard" | "Transactions" | "Accounts" | "Budgets" | "Income" | "Expenses" | "Bills & subscriptions" | "Savings goals" | "Debts & IOUs" | "Analytics" | "Reports" | "Settings";
@@ -48,7 +49,6 @@ export function FinanceApp() {
   const hydrationSequence = useRef(0);
   const currentUserId = useRef<string | null>(null);
   const saveBusy = useRef(false);
-  const pendingDebtPayments = useRef(new Map<string, DebtPayment>());
 
   useEffect(() => {
     let active = true;
@@ -107,16 +107,79 @@ export function FinanceApp() {
       saveBusy.current = true;
       setSyncState("syncing");
       try {
-        await saveCloudState(supabase, ownerId, state, next);
-        if (requestEpoch === authEpoch.current && currentUserId.current === ownerId) { setState(next); setSyncState("synced"); setToast(message); setModal(null); setEditTx(null); }
+        const saved = await saveCloudState(supabase, ownerId, state, next);
+        if (requestEpoch === authEpoch.current && currentUserId.current === ownerId) { setState(saved); setSyncState("synced"); setToast(message); setModal(null); setEditTx(null); }
       } catch (error) {
-        if (requestEpoch === authEpoch.current && currentUserId.current === ownerId) { setSyncState("error"); setToast(`Save did not fully synchronize. Reload cloud data before retrying: ${error instanceof Error ? error.message : "request failed"}`); }
+        if (requestEpoch === authEpoch.current && currentUserId.current === ownerId) { setSyncState("error"); setToast(`Save could not be confirmed. Reload cloud data before retrying: ${error instanceof Error ? error.message : "request failed"}`); }
       } finally { saveBusy.current = false; }
       return;
     }
     try { localStorage.setItem(STORE, JSON.stringify(next)); }
     catch { setToast("Could not save locally. Browser storage may be full or unavailable; your entry was not applied."); return; }
     setState(next); setModal(null); setEditTx(null); setToast(message);
+  };
+  const contributeToGoal = async (goal: FinanceGoal, amount: number, movement?: { sourceAccountId: string; destinationAccountId: string }) => {
+    if (!Number.isFinite(amount) || toPaise(amount) <= 0) return setToast("Enter a contribution greater than zero.");
+    if (!supabase || !user) {
+      const operationId = makeId();
+      const transactionId = movement ? makeId() : undefined;
+      const transfer: Transaction | null = movement ? { id: transactionId!, type: "transfer", amount, category: "Transfer", accountId: movement.sourceAccountId, destinationId: movement.destinationAccountId, merchant: `Savings · ${goal.name}`, date: localToday(), note: "Savings goal contribution", createdAt: new Date().toISOString() } : null;
+      const contribution: GoalContribution = { id: operationId, operationId, goalId: goal.id, amount, date: localToday(), ...(movement ? { accountId: movement.destinationAccountId, transactionId } : {}) };
+      const next: FinanceState = { ...state, transactions: transfer ? [transfer, ...state.transactions] : state.transactions, goalContributions: [...state.goalContributions, contribution], goals: state.goals.map(item => item.id === goal.id ? { ...item, saved: sumMoney([item.saved, amount]) } : item) };
+      await save(next, movement ? "Transfer and savings contribution recorded." : "Manual savings contribution recorded.");
+      setGoalToFund(null);
+      return;
+    }
+    if (saveBusy.current) return setToast("A save is still in progress. Wait before adding to this goal.");
+    const ownerId = user.id;
+    const requestEpoch = authEpoch.current;
+    const previousSyncState = syncState;
+    saveBusy.current = true;
+    setSyncState("syncing");
+    let persisted = false;
+    try {
+      const candidate: PendingOperation<GoalContributionOperation> = {
+        ownerId, kind: "goal_contribution", resourceId: goal.id, operationId: makeId(), createdAt: new Date().toISOString(),
+        payload: {
+          operationId: "", goalId: goal.id, amount, date: localToday(),
+          ...(movement ? { accountId: movement.destinationAccountId, sourceAccountId: movement.sourceAccountId, transactionId: makeId(), merchant: `Savings · ${goal.name}`, note: "Savings goal contribution" } : {}),
+        },
+      };
+      candidate.payload.operationId = candidate.operationId;
+      const queued = await browserOperationOutbox.put(candidate);
+      persisted = true;
+      const pending = queued.payload;
+      const sameIntent = pending.goalId === goal.id
+        && toPaise(pending.amount) === toPaise(amount)
+        && (pending.sourceAccountId ?? null) === (movement?.sourceAccountId ?? null)
+        && (pending.accountId ?? null) === (movement?.destinationAccountId ?? null)
+        && Boolean(pending.transactionId) === Boolean(movement);
+      if (!sameIntent) {
+        setSyncState(previousSyncState);
+        setToast("A previous contribution is awaiting confirmation. Retry it with the same amount and accounts first.");
+        return;
+      }
+      if (queued.operationId === candidate.operationId && previousSyncState !== "synced") {
+        await browserOperationOutbox.remove(ownerId, "goal_contribution", goal.id);
+        setSyncState(previousSyncState);
+        setToast("Reload cloud data before starting a new contribution.");
+        return;
+      }
+      await recordCloudGoalContribution(supabase, pending);
+      const cloud = await loadCloudState(supabase, ownerId);
+      if (!cloud.goalContributions.some(item => item.operationId === queued.operationId || item.id === queued.operationId)) {
+        throw new Error("The server response could not be confirmed in the refreshed cloud state.");
+      }
+      await browserOperationOutbox.remove(ownerId, "goal_contribution", goal.id);
+      if (requestEpoch === authEpoch.current && currentUserId.current === ownerId) {
+        setState(cloud); setSyncState("synced"); setToast(movement ? "Transfer and savings contribution recorded." : "Manual savings contribution recorded."); setGoalToFund(null);
+      }
+    } catch (error) {
+      if (requestEpoch === authEpoch.current && currentUserId.current === ownerId) {
+        setSyncState(persisted ? "error" : previousSyncState);
+        setToast(persisted ? `Contribution is safely queued. Retry the same amount and accounts to confirm it: ${error instanceof Error ? error.message : "request failed"}` : `Contribution was not sent because it could not be saved for retry: ${error instanceof Error ? error.message : "storage failed"}`);
+      }
+    } finally { saveBusy.current = false; }
   };
   const resetData = async () => {
     if (saveBusy.current) return setToast("A save is still in progress. Wait for it to finish before resetting data.");
@@ -125,7 +188,15 @@ export function FinanceApp() {
     const ownerId = user?.id ?? null; const requestEpoch = authEpoch.current;
     saveBusy.current = true; if (supabase && user) setSyncState("syncing");
     try {
-      if (supabase && user) await resetCloudData(supabase);
+      if (supabase && user) {
+        const pending = await browserOperationOutbox.list(user.id);
+        await browserOperationOutbox.clear(user.id);
+        try { await resetCloudData(supabase); }
+        catch (error) {
+          for (const operation of pending) await browserOperationOutbox.put(operation);
+          throw error;
+        }
+      }
       else localStorage.removeItem(STORE);
       if (requestEpoch === authEpoch.current && ownerId === currentUserId.current) { setState(EMPTY_STATE); setDiagnostics(null); setSyncState(supabase && user ? "synced" : "local"); setToast("Finance data reset."); }
     } catch (error) { if (requestEpoch === authEpoch.current && ownerId === currentUserId.current) { setSyncState("error"); setToast(`Reset failed: ${error instanceof Error ? error.message : "request failed"}`); } }
@@ -145,9 +216,12 @@ export function FinanceApp() {
     try {
       const cloud = await loadCloudState(supabase, ownerId);
       if (request === hydrationSequence.current && epoch === authEpoch.current && currentUserId.current === ownerId) {
-        for (const debt of cloud.debts) {
-          const key = `${ownerId}:${debt.id}`; const pending = pendingDebtPayments.current.get(key);
-          if (pending && debt.payments.some(payment => payment.id === pending.id || payment.operationId === pending.id)) pendingDebtPayments.current.delete(key);
+        const pendingOperations = await browserOperationOutbox.list(ownerId).catch(() => []);
+        for (const operation of pendingOperations) {
+          const confirmed = operation.kind === "debt_payment"
+            ? cloud.debts.some(debt => debt.id === operation.resourceId && debt.payments.some(payment => payment.id === operation.operationId || payment.operationId === operation.operationId))
+            : cloud.goalContributions.some(item => item.operationId === operation.operationId || item.id === operation.operationId);
+          if (confirmed) await browserOperationOutbox.remove(ownerId, operation.kind, operation.resourceId).catch(() => undefined);
         }
         setState(cloud); setSyncState("synced"); setToast("Cloud data reloaded. Review it before retrying your change.");
       }
@@ -163,33 +237,61 @@ export function FinanceApp() {
   };
   const recordDebtPayment = (debt: Debt, amount: number) => {
     if (!Number.isFinite(amount) || amount <= 0) return setToast("Enter a payment greater than zero.");
-    const pendingKey = `${user?.id ?? "local"}:${debt.id}`;
-    const pending = pendingDebtPayments.current.get(pendingKey);
-    if (pending && toPaise(pending.amount) !== toPaise(amount)) return setToast("A previous payment is awaiting confirmation. Retry that amount first.");
-    if (toPaise(amount) > toPaise(debt.remaining) && !pending) return setToast("Enter a payment up to the remaining amount.");
-    const payment = pending ?? { id: makeId(), amount, date: localToday(), note: "" };
-    pendingDebtPayments.current.set(pendingKey, payment);
     if (supabase && user) {
-      if (saveBusy.current || (syncState !== "synced" && !pending)) return setToast("Wait for cloud sync to finish before recording a payment.");
+      if (saveBusy.current) return setToast("A save is still in progress. Wait before recording a payment.");
       const requestEpoch = authEpoch.current; const ownerId = user.id;
       saveBusy.current = true; setSyncState("syncing");
-      void recordCloudDebtPayment(supabase, debt.id, payment).then(result => {
-        const saved = result[0];
-        if (!saved) throw new Error("The payment response did not include the saved balance.");
-        if (requestEpoch !== authEpoch.current || currentUserId.current !== ownerId) return;
-        const recorded = { ...payment, operationId: saved.payment_id, version: saved.payment_version };
-        setState(current => ({ ...current, debts: current.debts.map(item => item.id === debt.id ? { ...item, remaining: Number(saved.remaining), version: saved.debt_version, payments: [...item.payments.filter(existing => existing.id !== recorded.id), recorded] } : item) }));
-        pendingDebtPayments.current.delete(pendingKey); setSyncState("synced"); setToast(toPaise(amount) === toPaise(debt.remaining) ? "Debt marked settled." : "Payment recorded.");
-      }).catch(error => {
-        if (requestEpoch === authEpoch.current && currentUserId.current === ownerId) { setSyncState("error"); setToast(`Payment status is uncertain. Retry the same amount to safely confirm it: ${error instanceof Error ? error.message : "request failed"}`); }
-      }).finally(() => { saveBusy.current = false; });
+      void (async () => {
+        const resourceId = debt.id;
+        const candidate: PendingOperation<{ debtId: string; payment: DebtPayment }> = {
+          ownerId, kind: "debt_payment", resourceId, operationId: makeId(), createdAt: new Date().toISOString(),
+          payload: { debtId: resourceId, payment: { id: "", amount, date: localToday(), note: "" } },
+        };
+        candidate.payload.payment.id = candidate.operationId;
+        let pending = false;
+        let durable = false;
+        try {
+          const queued = await browserOperationOutbox.put(candidate);
+          durable = true;
+          pending = queued.operationId !== candidate.operationId;
+          const payment = queued.payload.payment;
+          if (toPaise(payment.amount) !== toPaise(amount)) {
+            setSyncState(syncState === "synced" ? "synced" : "error");
+            setToast(`A ₹${payment.amount.toFixed(2)} payment is still awaiting confirmation. Retry that same amount before starting another.`);
+            return;
+          }
+          if (!pending && syncState !== "synced") {
+            await browserOperationOutbox.remove(ownerId, "debt_payment", resourceId);
+            setSyncState("error"); setToast("Reload cloud data before starting a new payment."); return;
+          }
+          if (!pending && toPaise(amount) > toPaise(debt.remaining)) {
+            await browserOperationOutbox.remove(ownerId, "debt_payment", resourceId);
+            setSyncState("synced"); setToast("Enter a payment up to the remaining amount."); return;
+          }
+          const result = await recordCloudDebtPayment(supabase, debt.id, payment);
+          const saved = result[0];
+          if (!saved) throw new Error("The payment response did not include the saved balance.");
+          await browserOperationOutbox.remove(ownerId, "debt_payment", resourceId);
+          if (requestEpoch !== authEpoch.current || currentUserId.current !== ownerId) return;
+          const recorded = { ...payment, operationId: saved.payment_id, version: saved.payment_version };
+          setState(current => ({ ...current, debts: current.debts.map(item => item.id === debt.id ? { ...item, remaining: Number(saved.remaining), version: saved.debt_version, payments: [...item.payments.filter(existing => existing.id !== recorded.id), recorded] } : item) }));
+          setSyncState("synced"); setToast(toPaise(payment.amount) === toPaise(debt.remaining) ? "Debt marked settled." : "Payment recorded.");
+        } catch (error) {
+          if (requestEpoch === authEpoch.current && currentUserId.current === ownerId) {
+            setSyncState(durable ? "error" : syncState);
+            setToast(durable ? `Payment is queued safely. Retry the same amount to confirm it: ${error instanceof Error ? error.message : "request failed"}` : `Payment was not sent because it could not be saved for retry: ${error instanceof Error ? error.message : "storage failed"}`);
+          }
+        } finally { saveBusy.current = false; }
+      })();
       return;
     }
+    if (toPaise(amount) > toPaise(debt.remaining)) return setToast("Enter a payment up to the remaining amount.");
+    const payment = { id: makeId(), amount, date: localToday(), note: "" };
     const remaining = Math.max(0, fromPaise(toPaise(debt.remaining) - toPaise(amount)));
     const next: FinanceState = { ...state, debts: state.debts.map(d => d.id === debt.id ? { ...d, remaining, payments: [...d.payments, payment] } : d) };
     try { localStorage.setItem(STORE, JSON.stringify(next)); }
     catch { return setToast("Could not save locally; the payment was not recorded."); }
-    setState(next); pendingDebtPayments.current.delete(pendingKey); setToast(toPaise(amount) === toPaise(debt.remaining) ? "Debt marked settled." : "Payment recorded.");
+    setState(next); setToast(toPaise(amount) === toPaise(debt.remaining) ? "Debt marked settled." : "Payment recorded.");
   };
   const changeDebtPayment = (debt: Debt, payment: DebtPayment, nextPayment: DebtPayment | null) => {
     if (saveBusy.current || (supabase && user && syncState !== "synced")) return setToast("Wait for cloud sync or reload before changing a payment.");
@@ -202,13 +304,23 @@ export function FinanceApp() {
     void (async () => {
       try {
         let remaining = nextRemaining;
-        if (supabase && user) remaining = nextPayment ? await editCloudDebtPayment(supabase, nextPayment) : await deleteCloudDebtPayment(supabase, payment);
+        let debtVersion: number | undefined;
+        let paymentVersion: number | undefined;
+        if (supabase && user) {
+          if (nextPayment) {
+            const result = await editCloudDebtPayment(supabase, nextPayment);
+            remaining = result.remaining; debtVersion = result.debtVersion; paymentVersion = result.paymentVersion;
+          } else {
+            const result = await deleteCloudDebtPayment(supabase, payment);
+            remaining = result.remaining; debtVersion = result.debtVersion;
+          }
+        }
         else {
           const next: FinanceState = { ...state, debts: state.debts.map(item => item.id === debt.id ? { ...item, remaining, payments: nextPayments } : item) };
           localStorage.setItem(STORE, JSON.stringify(next));
         }
         if (requestEpoch === authEpoch.current && ownerId === currentUserId.current) {
-          setState(current => ({ ...current, debts: current.debts.map(item => item.id === debt.id ? { ...item, remaining, ...(supabase && user ? { version: (item.version ?? 0) + 1 } : {}), payments: nextPayment ? [...item.payments.filter(existing => existing.id !== payment.id), { ...nextPayment, ...(supabase && user ? { version: (payment.version ?? 0) + 1 } : {}) }] : item.payments.filter(existing => existing.id !== payment.id) } : item) }));
+          setState(current => ({ ...current, debts: current.debts.map(item => item.id === debt.id ? { ...item, remaining, ...(debtVersion !== undefined ? { version: debtVersion } : {}), payments: nextPayment ? [...item.payments.filter(existing => existing.id !== payment.id), { ...nextPayment, ...(paymentVersion !== undefined ? { version: paymentVersion } : {}) }] : item.payments.filter(existing => existing.id !== payment.id) } : item) }));
           setSyncState(supabase && user ? "synced" : "local"); setToast(nextPayment ? "Payment updated." : "Payment deleted.");
         }
       } catch (error) {
@@ -249,7 +361,7 @@ export function FinanceApp() {
     <nav className="mobile-nav">{[{ name: "Dashboard" as Section, icon: Home }, { name: "Transactions" as Section, icon: ArrowLeftRight }, { name: "Accounts" as Section, icon: Wallet }, { name: "Budgets" as Section, icon: ListFilter }].map(i => <button key={i.name} onClick={() => setSection(i.name)} className={section === i.name ? "active" : ""}><i.icon/><span>{i.name}</span></button>)}<button onClick={() => setModal("transaction")} className="active"><Plus/><span>Add</span></button></nav>
     {modal && modal !== "debt" && <EntryModal kind={modal} initial={editTx} accounts={state.accounts} state={state} onClose={() => { setModal(null); setEditTx(null); }} onTransaction={t => void save({ ...state, transactions: editTx ? state.transactions.map(x => x.id === editTx.id ? t : x) : [t, ...state.transactions] }, editTx ? "Transaction updated." : "Transaction added.")} onAccount={a => void save({ ...state, accounts: [...state.accounts, a] }, "Account created.")} onBudget={b => void save({ ...state, budgets: [...state.budgets.filter(x => !(x.category === b.category && x.month === b.month)), b] }, "Budget saved.")} onGoal={g => void save({ ...state, goals: [...state.goals, g] }, "Savings goal created.")}/>}
     {modal === "debt" && <DebtModal onClose={() => setModal(null)} onSave={debt => void save({ ...state, debts: [debt, ...state.debts] }, "Debt reminder saved.")}/>}
-    {goalToFund && <GoalContributionModal goal={goalToFund} accounts={state.accounts} balances={balances} onClose={() => setGoalToFund(null)} onManual={amount => { const contribution: GoalContribution = { id: makeId(), goalId: goalToFund.id, amount, date: localToday() }; void save({ ...state, goalContributions: [...state.goalContributions, contribution], goals: state.goals.map(g => g.id === goalToFund.id ? { ...g, saved: sumMoney([g.saved, amount]) } : g) }, "Manual savings contribution recorded."); setGoalToFund(null); }} onMove={(amount, sourceId, destinationId) => { const transferId = makeId(); const transfer: Transaction = { id: transferId, type: "transfer", amount, category: "Transfer", accountId: sourceId, destinationId, merchant: `Savings · ${goalToFund.name}`, date: localToday(), note: "Savings goal contribution", createdAt: new Date().toISOString() }; const contribution: GoalContribution = { id: makeId(), goalId: goalToFund.id, amount, date: localToday(), accountId: destinationId, transactionId: transferId }; void save({ ...state, transactions: [transfer, ...state.transactions], goalContributions: [...state.goalContributions, contribution], goals: state.goals.map(g => g.id === goalToFund.id ? { ...g, saved: sumMoney([g.saved, amount]) } : g) }, "Transfer and savings contribution recorded."); setGoalToFund(null); }}/>}
+    {goalToFund && <GoalContributionModal goal={goalToFund} accounts={state.accounts} balances={balances} onClose={() => setGoalToFund(null)} onManual={amount => { void contributeToGoal(goalToFund, amount); }} onMove={(amount, sourceId, destinationId) => { void contributeToGoal(goalToFund, amount, { sourceAccountId: sourceId, destinationAccountId: destinationId }); }}/>}
     {!ready && <div className="toast">Loading your workspace…</div>}{toast && ready && <div className="toast" role="status">{toast}</div>}
   </div>;
 }

@@ -14,6 +14,18 @@ type WriteRow = Record<string, string | number | null | string[]>;
 type Versioned = { id: string; version?: number };
 export class SyncConflictError extends Error { constructor(message = "This record changed on another device. Reload before saving again.") { super(message); this.name = "SyncConflictError"; } }
 
+export type GoalContributionOperation = {
+  operationId: string;
+  goalId: string;
+  amount: number;
+  date: string;
+  accountId?: string;
+  transactionId?: string;
+  sourceAccountId?: string;
+  merchant?: string;
+  note?: string;
+};
+
 export async function loadCloudState(client: SupabaseClient, userId: string): Promise<FinanceState> {
   const [accounts, categories, transactions, budgets, goals, contributions, debts, debtPayments] = await Promise.all([
     fetchAll(from => client.from("accounts").select("*").eq("user_id", userId).order("id").range(from, from + 999)),
@@ -54,7 +66,7 @@ async function fetchAll<T>(page: (from: number) => PromiseLike<{ data: T[] | nul
   }
 }
 
-/** Persist explicit rows only. Updates and deletes compare the row version read by this client. */
+/** Persist one snapshot diff through a single database transaction. */
 export async function saveCloudState(client: SupabaseClient, userId: string, before: FinanceState, after: FinanceState) {
   const beforeDebts = new Map(before.debts.map(d => [d.id, d]));
   for (const debt of after.debts) {
@@ -63,8 +75,9 @@ export async function saveCloudState(client: SupabaseClient, userId: string, bef
       throw new Error("Debt repayment changes must use the atomic repayment operation.");
     }
   }
-
-  await syncRows(client, "accounts", userId, before.accounts, after.accounts, a => ({ id: a.id, user_id: userId, name: a.name, account_type: dbAccountType(a.kind), institution: a.institution || null, opening_balance: a.openingBalance, currency: "INR", created_at: a.createdAt }));
+  if (JSON.stringify(before.goalContributions) !== JSON.stringify(after.goalContributions)) {
+    throw new Error("Savings contributions must use the atomic contribution operation.");
+  }
 
   const categoryIds = new Map<string, string>();
   const resolve = async (kind: string, name: string) => {
@@ -75,16 +88,52 @@ export async function saveCloudState(client: SupabaseClient, userId: string, bef
   for (const t of after.transactions.filter(t => t.type !== "transfer" && t.type !== "credit_card_payment")) await resolve(t.type === "income" ? "income" : "expense", t.category || "Other");
   for (const b of after.budgets) await resolve("expense", b.category || "Other");
 
-  await syncRows(client, "transactions", userId, before.transactions, after.transactions, t => ({
-    id: t.id, user_id: userId, transaction_type: t.type, status: t.status ?? "posted", amount: t.amount, currency: "INR", category_id: t.type === "transfer" || t.type === "credit_card_payment" ? null : categoryIds.get(`${t.type === "income" ? "income" : "expense"}:${t.category || "Other"}`) ?? null,
-    account_id: t.accountId, destination_account_id: t.destinationId ?? null, merchant: t.merchant || null, transaction_date: t.date,
-    notes: t.note || null, created_at: t.createdAt,
-  }));
-  await syncRows(client, "budgets", userId, before.budgets, after.budgets, b => ({ id: b.id, user_id: userId, name: b.category, category_id: categoryIds.get(`expense:${b.category || "Other"}`) ?? null, amount: b.limit, period: "monthly", starts_on: `${b.month}-01` }));
+  const snapshot = {
+    accounts: buildSyncDelta(before.accounts, after.accounts, a => ({ id: a.id, user_id: userId, name: a.name, account_type: dbAccountType(a.kind), institution: a.institution || null, opening_balance: a.openingBalance, currency: "INR", created_at: a.createdAt })),
+    transactions: buildSyncDelta(before.transactions, after.transactions, t => ({
+      id: t.id, user_id: userId, transaction_type: t.type, status: t.status ?? "posted", amount: t.amount, currency: "INR", category_id: t.type === "transfer" || t.type === "credit_card_payment" ? null : categoryIds.get(`${t.type === "income" ? "income" : "expense"}:${t.category || "Other"}`) ?? null,
+      account_id: t.accountId, destination_account_id: t.destinationId ?? null, merchant: t.merchant || null, transaction_date: t.date,
+      notes: t.note || null, created_at: t.createdAt,
+    })),
+    budgets: buildSyncDelta(before.budgets, after.budgets, b => ({ id: b.id, user_id: userId, name: b.category, category_id: categoryIds.get(`expense:${b.category || "Other"}`) ?? null, amount: b.limit, period: "monthly", starts_on: `${b.month}-01` })),
+    financial_goals: buildSyncDelta(before.goals, after.goals, g => ({ id: g.id, user_id: userId, name: g.name, target_amount: g.target, target_date: g.due || null }), (a, b) => a.name === b.name && a.target === b.target && a.due === b.due),
+    debt_obligations: buildSyncDelta(before.debts, after.debts, d => ({ id: d.id, user_id: userId, person: d.person, direction: d.direction, amount: d.amount, remaining: d.remaining, due_date: d.due || null, reminder_date: d.reminder || null, note: d.note || null, created_at: d.createdAt })),
+  };
+  const { error } = await client.rpc("save_finance_state", { p_snapshot: snapshot });
+  if (error) throw error;
+  return loadCloudState(client, userId);
+}
 
-  await syncRows(client, "financial_goals", userId, before.goals, after.goals, g => ({ id: g.id, user_id: userId, name: g.name, target_amount: g.target, target_date: g.due || null }), (a, b) => a.name === b.name && a.target === b.target && a.due === b.due);
-  await insertGoalContributions(client, userId, before.goalContributions, after.goalContributions);
-  await syncRows(client, "debt_obligations", userId, before.debts, after.debts, d => ({ id: d.id, user_id: userId, person: d.person, direction: d.direction, amount: d.amount, remaining: d.remaining, due_date: d.due || null, reminder_date: d.reminder || null, note: d.note || null, created_at: d.createdAt }));
+export function buildSyncDelta<T extends Versioned>(before: T[], after: T[], toRow: (item: T) => WriteRow, same: (a: T, b: T) => boolean = (a, b) => JSON.stringify(a) === JSON.stringify(b)) {
+  const old = new Map(before.map(item => [item.id, item]));
+  const currentIds = new Set(after.map(item => item.id));
+  const writes = after.flatMap(item => {
+    const previous = old.get(item.id);
+    if (previous && same(previous, item)) return [];
+    if (previous && typeof previous.version !== "number") throw new SyncConflictError("Reload before saving a record so its current version can be checked.");
+    return [{ ...toRow(item), expected_version: previous?.version ?? null }];
+  });
+  const deletes = before.filter(item => !currentIds.has(item.id)).map(item => {
+    if (typeof item.version !== "number") throw new SyncConflictError("Reload before deleting a record so its current version can be checked.");
+    return { id: item.id, version: item.version };
+  });
+  return { writes, deletes };
+}
+
+export async function recordCloudGoalContribution(client: SupabaseClient, operation: GoalContributionOperation) {
+  const result = await client.rpc("record_goal_contribution", {
+    p_operation_id: operation.operationId,
+    p_goal_id: operation.goalId,
+    p_amount: operation.amount,
+    p_contributed_at: operation.date,
+    p_account_id: operation.accountId ?? null,
+    p_transaction_id: operation.transactionId ?? null,
+    p_source_account_id: operation.sourceAccountId ?? null,
+    p_merchant: operation.merchant ?? null,
+    p_note: operation.note ?? null,
+  });
+  if (result.error) throw result.error;
+  return result.data as { contribution_id: string; transaction_id: string | null }[];
 }
 
 export async function recordCloudDebtPayment(client: SupabaseClient, debtId: string, payment: DebtPayment) {
@@ -95,17 +144,20 @@ export async function recordCloudDebtPayment(client: SupabaseClient, debtId: str
 
 export async function editCloudDebtPayment(client: SupabaseClient, payment: DebtPayment) {
   if (typeof payment.version !== "number") throw new SyncConflictError("Reload before editing this payment to obtain its current version.");
-  const result = await client.rpc("edit_debt_payment", { p_payment_id: payment.id, p_expected_version: payment.version, p_amount: payment.amount, p_payment_date: payment.date, p_note: payment.note || null });
+  const result = await client.rpc("edit_debt_payment_v2", { p_payment_id: payment.id, p_expected_version: payment.version, p_amount: payment.amount, p_payment_date: payment.date, p_note: payment.note || null });
   if (result.error) throw result.error;
-  return Number(result.data);
+  const row = (result.data as { remaining: number; debt_version: number; payment_version: number }[] | null)?.[0];
+  if (!row) throw new Error("The payment edit response did not include updated database versions.");
+  return { remaining: Number(row.remaining), debtVersion: Number(row.debt_version), paymentVersion: Number(row.payment_version) };
 }
 
 export async function deleteCloudDebtPayment(client: SupabaseClient, payment: DebtPayment) {
   if (typeof payment.version !== "number") throw new SyncConflictError("Reload before deleting this payment to obtain its current version.");
-  const result = await client.rpc("delete_debt_payment", { p_payment_id: payment.id, p_expected_version: payment.version });
+  const result = await client.rpc("delete_debt_payment_v2", { p_payment_id: payment.id, p_expected_version: payment.version });
   if (result.error) throw result.error;
-  if (result.data === null) throw new SyncConflictError("This payment was already removed. Reload the cloud data to confirm its current balance.");
-  return Number(result.data);
+  const row = (result.data as { remaining: number; debt_version: number }[] | null)?.[0];
+  if (!row) throw new SyncConflictError("This payment was already removed. Reload the cloud data to confirm its current balance.");
+  return { remaining: Number(row.remaining), debtVersion: Number(row.debt_version) };
 }
 
 export async function resetCloudData(client: SupabaseClient) {
@@ -126,68 +178,6 @@ async function resolveCategoryId(client: SupabaseClient, userId: string, kind: s
   const { data: raced, error: racedError } = await client.from("categories").select("id").eq("user_id", userId).eq("kind", kind).eq("name", name).single();
   if (racedError) throw racedError;
   return raced.id as string;
-}
-
-async function insertGoalContributions(client: SupabaseClient, userId: string, before: GoalContribution[], after: GoalContribution[]) {
-  const old = new Set(before.map(item => item.id));
-  for (const item of after) {
-    if (old.has(item.id)) continue;
-    const row = { id: item.id, operation_id: item.id, user_id: userId, goal_id: item.goalId, amount: item.amount, contributed_at: item.date, account_id: item.accountId ?? null, transaction_id: item.transactionId ?? null };
-    const { error } = await client.from("goal_contributions").insert(row);
-    if (!error) continue;
-    if (error.code !== "23505") throw error;
-    const { data, error: readError } = await client.from("goal_contributions").select("goal_id,amount,contributed_at,account_id,transaction_id").eq("user_id", userId).eq("operation_id", item.id).maybeSingle();
-    if (readError) throw readError;
-    if (!data || data.goal_id !== item.goalId || Number(data.amount) !== item.amount || data.contributed_at !== item.date || data.account_id !== (item.accountId ?? null) || data.transaction_id !== (item.transactionId ?? null)) throw new SyncConflictError("A goal contribution operation ID was reused with different details.");
-  }
-}
-
-async function syncRows<T extends Versioned>(client: SupabaseClient, table: string, userId: string, before: T[], after: T[], toRow: (item: T) => WriteRow, same: (before: T, after: T) => boolean = (a, b) => JSON.stringify(a) === JSON.stringify(b)) {
-  const old = new Map(before.map(item => [item.id, item]));
-  for (const item of after) {
-    const previous = old.get(item.id);
-    const row = toRow(item);
-    if (!previous) {
-      const { data: inserted, error } = await client.from(table).insert(row).select("version").single();
-      if (!error) { item.version = Number(inserted.version); continue; }
-      if (error.code !== "23505") throw error;
-      const { data, error: readError } = await client.from(table).select("*").eq("id", item.id).eq("user_id", userId).maybeSingle();
-      if (readError) throw readError;
-      if (!data || !samePersistedRow(row, data)) throw new SyncConflictError(`A ${table} record with this ID already exists with different data.`);
-      item.version = Number(data.version);
-      continue;
-    }
-    if (same(previous, item)) continue;
-    if (typeof previous.version !== "number") throw new SyncConflictError(`Cannot safely update ${table}: reload to obtain its version.`);
-    const patch = { ...row };
-    delete patch.id; delete patch.user_id; delete patch.version; delete patch.created_at; delete patch.updated_at;
-    const { data, error } = await client.from(table).update(patch).eq("id", item.id).eq("user_id", userId).eq("version", previous.version).select("version").maybeSingle();
-    if (error) throw error;
-    if (!data) throw new SyncConflictError(`A ${table} record changed on another device. Reload before saving.`);
-    item.version = Number(data.version);
-  }
-  await deleteMissing(client, table, userId, before, after);
-}
-
-function samePersistedRow(row: WriteRow, actual: Record<string, unknown>) {
-  return Object.entries(row).filter(([key]) => !["version", "updated_at"].includes(key)).every(([key, value]) => {
-    const current = actual[key];
-    return value === current || (typeof value === "number" && typeof current === "string" && Number(value) === Number(current));
-  });
-}
-
-async function deleteMissing<T extends Versioned>(client: SupabaseClient, table: string, userId: string, before: T[], after: T[]) {
-  const keep = new Set(after.map(item => item.id));
-  for (const old of before.filter(item => !keep.has(item.id))) {
-    if (typeof old.version !== "number") throw new SyncConflictError(`Cannot safely delete from ${table}: reload to obtain its version.`);
-    const { data, error } = await client.from(table).delete().eq("user_id", userId).eq("id", old.id).eq("version", old.version).select("id");
-    if (error) throw error;
-    if (!data?.length) {
-      const { data: current, error: readError } = await client.from(table).select("id").eq("user_id", userId).eq("id", old.id).maybeSingle();
-      if (readError) throw readError;
-      if (current) throw new SyncConflictError(`A ${table} record changed on another device and was not deleted.`);
-    }
-  }
 }
 
 function transactionType(value: string): TxType {

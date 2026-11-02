@@ -1,5 +1,5 @@
 begin;
-select plan(13);
+select plan(16);
 
 select ok(
   exists (select 1 from pg_trigger where tgname = 'categories_integrity_guard' and not tgisinternal)
@@ -46,6 +46,25 @@ select ok(
 select ok(
   (select count(*) = 4 from pg_proc where proname in ('record_debt_payment','edit_debt_payment','delete_debt_payment','reset_my_finance_data')),
   'all atomic repayment and reset RPCs exist'
+);
+
+select ok(
+  (select prosecdef from pg_proc where oid = 'public.save_finance_state(jsonb)'::regprocedure)
+  and (select prosecdef from pg_proc where oid = 'public.record_goal_contribution(uuid,uuid,numeric,date,uuid,uuid,uuid,text,text)'::regprocedure),
+  'snapshot and savings contribution writes use database transactions in scoped security-definer RPCs'
+);
+
+select ok(
+  not has_function_privilege('anon', 'public.save_finance_state(jsonb)', 'execute')
+  and not has_function_privilege('anon', 'public.record_goal_contribution(uuid,uuid,numeric,date,uuid,uuid,uuid,text,text)', 'execute')
+  and has_function_privilege('authenticated', 'public.save_finance_state(jsonb)', 'execute')
+  and has_function_privilege('authenticated', 'public.record_goal_contribution(uuid,uuid,numeric,date,uuid,uuid,uuid,text,text)', 'execute'),
+  'atomic write RPCs are unavailable to anonymous clients and callable by authenticated users'
+);
+
+select ok(
+  (select count(*) = 2 from pg_proc where proname in ('edit_debt_payment_v2','delete_debt_payment_v2')),
+  'debt payment edit and delete RPCs return database-generated versions'
 );
 
 select ok(
