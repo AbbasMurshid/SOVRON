@@ -16,14 +16,21 @@ export class SyncConflictError extends Error { constructor(message = "This recor
 
 /** Preserve PostgREST diagnostics when an SDK/network error is a plain object. */
 export function cloudErrorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message || error.name;
   if (error && typeof error === "object") {
     const value = error as Record<string, unknown>;
     const fields = ["message", "code", "details", "hint", "status", "statusText"]
       .map(key => value[key])
       .filter((item): item is string | number => typeof item === "string" || typeof item === "number")
       .map(String);
-    if (fields.length) return [...new Set(fields)].join(" · ");
+    const cause = error instanceof Error && "cause" in error ? error.cause : undefined;
+    if (fields.length) {
+      const label = error instanceof Error && error.name !== "Error" ? `${error.name}: ` : "";
+      const detail = [...new Set(fields)].join(" · ");
+      return `${label}${detail}${cause ? ` · caused by ${cloudErrorMessage(cause)}` : ""}`;
+    }
+    if (error instanceof Error) {
+      return cause ? `${error.name}: ${error.message} · caused by ${cloudErrorMessage(cause)}` : `${error.name}: ${error.message}`;
+    }
     try { return JSON.stringify(error); } catch { /* fall through */ }
   }
   return typeof error === "string" && error ? error : "Unknown Supabase error (no response details were provided).";
@@ -74,7 +81,7 @@ async function fetchAll<T>(page: (from: number) => PromiseLike<{ data: T[] | nul
   const rows: T[] = [];
   for (let from = 0; ; from += 1000) {
     const result = await page(from);
-    if (result.error) throw result.error;
+    if (result.error) throw new Error(`Supabase read failed: ${cloudErrorMessage(result.error)}`);
     const batch = result.data ?? [];
     rows.push(...batch);
     if (batch.length < 1000) return rows;
@@ -182,16 +189,16 @@ export async function resetCloudData(client: SupabaseClient) {
 
 async function resolveCategoryId(client: SupabaseClient, userId: string, kind: string, name: string) {
   const { data: own, error: ownError } = await client.from("categories").select("id").eq("user_id", userId).eq("kind", kind).eq("name", name).maybeSingle();
-  if (ownError) throw ownError;
+  if (ownError) throw new Error(`Could not look up the transaction category: ${cloudErrorMessage(ownError)}`);
   if (own?.id) return own.id as string;
   const { data: global, error: globalError } = await client.from("categories").select("id").is("user_id", null).eq("kind", kind).eq("name", name).maybeSingle();
-  if (globalError) throw globalError;
+  if (globalError) throw new Error(`Could not look up the shared transaction category: ${cloudErrorMessage(globalError)}`);
   if (global?.id) return global.id as string;
   const { data: created, error } = await client.from("categories").insert({ user_id: userId, kind, name }).select("id").single();
   if (!error) return created.id as string;
-  if (error.code !== "23505") throw error;
+  if (error.code !== "23505") throw new Error(`Could not save the transaction category: ${cloudErrorMessage(error)}`);
   const { data: raced, error: racedError } = await client.from("categories").select("id").eq("user_id", userId).eq("kind", kind).eq("name", name).single();
-  if (racedError) throw racedError;
+  if (racedError) throw new Error(`Could not reload the transaction category: ${cloudErrorMessage(racedError)}`);
   return raced.id as string;
 }
 
