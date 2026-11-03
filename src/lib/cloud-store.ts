@@ -14,6 +14,21 @@ type WriteRow = Record<string, string | number | null | string[]>;
 type Versioned = { id: string; version?: number };
 export class SyncConflictError extends Error { constructor(message = "This record changed on another device. Reload before saving again.") { super(message); this.name = "SyncConflictError"; } }
 
+/** Preserve PostgREST diagnostics when an SDK/network error is a plain object. */
+export function cloudErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message || error.name;
+  if (error && typeof error === "object") {
+    const value = error as Record<string, unknown>;
+    const fields = ["message", "code", "details", "hint", "status", "statusText"]
+      .map(key => value[key])
+      .filter((item): item is string | number => typeof item === "string" || typeof item === "number")
+      .map(String);
+    if (fields.length) return [...new Set(fields)].join(" · ");
+    try { return JSON.stringify(error); } catch { /* fall through */ }
+  }
+  return typeof error === "string" && error ? error : "Unknown Supabase error (no response details were provided).";
+}
+
 export type GoalContributionOperation = {
   operationId: string;
   goalId: string;
@@ -100,7 +115,7 @@ export async function saveCloudState(client: SupabaseClient, userId: string, bef
     debt_obligations: buildSyncDelta(before.debts, after.debts, d => ({ id: d.id, user_id: userId, person: d.person, direction: d.direction, amount: d.amount, remaining: d.remaining, due_date: d.due || null, reminder_date: d.reminder || null, note: d.note || null, created_at: d.createdAt })),
   };
   const { error } = await client.rpc("save_finance_state", { p_snapshot: snapshot });
-  if (error) throw error;
+  if (error) throw new Error(`Supabase save failed: ${cloudErrorMessage(error)}`);
   return loadCloudState(client, userId);
 }
 
